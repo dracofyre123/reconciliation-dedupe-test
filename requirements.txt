@@ -1,0 +1,4 @@
+Flask-Jsonpify
+Flask
+dedupe
+Unidecode==0.4.16
