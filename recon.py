@@ -33,18 +33,21 @@ from flask import g
 
 import uuid
 
+from extras.utilties import preProcessColumnValue
+from extras.utilties import processPlace
+
 app = Flask(__name__)
 
 
 DATABASE = 'session.db'
 
-default_settings_file = 'gazetteer_learned_settings'
-default_training_file = 'gazetteer_training.json'
+default_settings_file = 'models/gazetteer_learned_settings'
+default_training_file = 'models/gazetteer_training.json'
 
 canonical = None
 messy = None
 
-
+logger = None
 # these are all from the flask docs
 def get_db():
     db = getattr(g, '_database', None)
@@ -70,7 +73,7 @@ def query_db(query, args=(), one=False):
 metadata = {
     "name": "Example Reconciliation Service",
     "defaultTypes": [
-        {"id": "Resturants", "name": "ResturantNames"},
+        {"id": "Places", "name": "Place Name", "country": "country", "type": "type", "latitude": "latitude", "longitude":"longitude"},
     ]
 }
 
@@ -80,36 +83,18 @@ metadata = {
 # with regards to addtional property types, but it would make the
 # testbench web app pretty useless
 fields = [
-    {'field': 'name', 'type': 'String'},
-    #{'field': 'title', 'type': 'Text', 'corpus': descriptions()},
-    #{'field': 'addr', 'type': 'String', 'has missing': True},
-    #{'field': 'city', 'type': 'String', 'has missing': True},
-    #{'field': 'phone', 'type': 'String', 'has missing': True},
-    #{'field': 'type', 'type': 'String', 'has missing': True},
+    {'field': 'name', 'variable name': 'name', 'type': 'String'},
+    {'field' : 'country', 'type': 'Exact', 'variable name': 'country'},
+    {'field' : 'type', 'type': 'ShortString', 'variable name': 'location_type', 'has missing' : True},
+    {'field' : 'location', 'type': 'LatLong', 'variable name':'latlng', 'has missing' : True},
+    {'type': 'Interaction', 'interaction variables': [
+        'name',
+        'country',
+        'location_type',
+        'latlng'
+        ]
+    }
 ]
-
-
-
-
-def preProcess(column):
-    """
-    Do a little bit of data cleaning with the help of Unidecode and Regex.
-    Things like casing, extra spaces, quotes and new lines can be ignored.
-    """
-
-    column = unidecode(column)
-    column = re.sub('\n', ' ', column)
-    column = re.sub('-', '', column)
-    column = re.sub('/', ' ', column)
-    column = re.sub("'", '', column)
-    column = re.sub(",", '', column)
-    column = re.sub(":", ' ', column)
-    column = re.sub(' +', ' ', column)
-    column = column.strip().strip('"').strip("'").lower().strip()
-    if not column:
-        column = None
-    return column
-
 
 def readData(filename):
     """
@@ -120,21 +105,22 @@ def readData(filename):
     data_d = {}
 
     with open(filename) as f:
-        reader = csv.DictReader(f)
+        reader = csv.DictReader(f, delimiter="\t")
         for i, row in enumerate(reader):
-            clean_row = dict([(k, preProcess(v)) for (k, v) in row.items()])
-            data_d[clean_row['id']] = dict(clean_row)
-
+            try:
+                clean_Row = processPlace(row)
+                data_d[clean_Row['id']] = clean_Row
+            except  Exception as inst:
+                print('Invalid Row: {0}'.format(i))
+                print(inst)
     return data_d
-
-
 
 @app.route("/session", methods=["POST"])
 def new_sesion():
     cur = get_db().cursor()
     session_id = uuid.uuid4()
     created_time = datetime.datetime.now().isoformat()
-    results = cur.execute("INSERT INTO session VALUES(?, ?, ?, ?, ?)", (str(session_id), None, created_time, created_time, 'NEW'))
+    cur.execute("INSERT INTO session VALUES(?, ?, ?, ?, ?)", (str(session_id), None, created_time, created_time, 'NEW'))
     cur.close()
     get_db().commit()
     return jsonify({"session_id": str(session_id)})
@@ -179,8 +165,8 @@ def add_training_data(session_id):
 
     content = request.json
     # these need to be actual tuples, I think?
-    # TODO: obviously validate more of the request, don't just take raw JSON from the client
-    content['match'] = [(x[0], x[1]) for x in content['match']]
+    # TODO: obviously validate more of the request, don't just take raw JSON from the clifent
+    content['match'] = [(processPlace(x[0]), processPlace(x[1])) for x in content['match']]
 
     gazetteer.mark_pairs(content)
     gazetteer.train()
@@ -198,7 +184,7 @@ def add_training_data(session_id):
     cur = get_db().cursor()
     updated_time = datetime.datetime.now().isoformat()
     try:
-        results = cur.execute("UPDATE session SET currentversion = ?, updated_date = ?, status = 'TRAINED' where id = ?", (str(new_version_id), updated_time, str(session_id)))
+        cur.execute("UPDATE session SET currentversion = ?, updated_date = ?, status = 'TRAINED' where id = ?", (str(new_version_id), updated_time, str(session_id)))
         get_db().commit()
     except sqlite3.Error as e:
         print(e)
@@ -218,17 +204,16 @@ def resolve(q, gazetteer):
     """
     limit = int(q.get('limit', 10))
 
-    query = q.get('query', '')
+    name = q.get('name', '')
     res = []
-    target = {"target": {"name": query, "addr": None, "city": None, "phone": None, "type": None}}
+    target = {"target": {"name": name, "country": None, "latitude": None, "longitude": None, "type": None}}
 
     results = gazetteer.search(target, n_matches=limit, generator=True)
 
     for cluster_id, (messy_id, matches) in enumerate(results):
 
         for canon_id, score in matches:
-            #print("matching {} to {}".format(messy_id, canon_id))
-
+            logger.debug("matching {} to {}".format(messy_id, canon_id))
             res.append({
                 'id': canon_id,
                 'name': canonical[canon_id]["name"],
@@ -238,6 +223,37 @@ def resolve(q, gazetteer):
             })
     return res
 
+def resolvePlace(q, gazetteer : dedupe.Gazetteer, candidates, limit: int = 1, threshold: float = 0.5):
+    """
+    q has fields:
+    - query: string of the label that needs to be converted to a Brick type
+    - type: optional list of 'types' (e.g. "PointClass" above)
+    - limit: optional limit on # of returned candidates (default to 10)
+    - properties: optional map of property idents to values
+    - type_strict: [any, all, should] for strictness on the types returned
+    """
+
+    place = processPlace(q)
+    res = []
+    target = {"target": place}
+
+    results = gazetteer.search(target, n_matches=limit, threshold=threshold, generator=True)
+
+    for cluster_id, (messy_id, matches) in enumerate(results):
+
+        for canon_id, score in matches:
+            logger.debug("matching {} to {}".format(messy_id, canon_id))
+            res.append({
+                'id': canon_id,
+                'name': candidates[canon_id]["name"],
+                'country': candidates[canon_id]["country"],
+                'type': candidates[canon_id]["type"],
+                'latitude': candidates[canon_id]["latitude"],
+                'longitude': candidates[canon_id]["longitude"],
+                'score': float(score),
+                'match': True
+            })
+    return res
 
 @app.route("/reconcile", methods=["POST", "GET"])
 def reconcile():
@@ -286,6 +302,113 @@ def reconcile():
     # if no queries, then return the manifest
     return jsonify(metadata)
 
+@app.route("/reconcileplace", methods=["POST", "GET"])
+def reconcilePlace():
+
+    # if request.method == "GET":
+    #     queries = json.loads(request.args.get("queries", "[]"))
+    #     session_id = request.args.get("session", None)
+    # else:
+    #     queries = json.loads(request.form.get("queries", "[]"))
+    #     session_id = request.form.get("session", None)
+    content = request.json
+    session_id = content.get('session_id')
+    queries = content.get('queries')
+    # look for a new/nonstandard property in the form/params for session
+    version_id = None
+    if session_id:
+        try:
+            valid_uuid_obj = uuid.UUID(session_id, version=4)
+        except ValueError:
+            return False
+        # normalize the sessionid for caps (ab123-xxx vs AB123-)
+        session_id = str(valid_uuid_obj)
+        session_info = query_db("SELECT * from session where id = ?", [str(session_id)], one=True)
+        version_id = session_info[1]
+        if session_info[4] == "NEW":
+            print("WARNING: session has not yet added training data, version_id is {} so default training session will be used".format(version_id))
+    
+    
+    if queries:
+        settings_file = default_settings_file
+        if version_id:
+            # demoware so we don't care about security
+            # also because they're UUIDs for now just treat the version_ids as distinct
+            # though it really should be sesssion_id.version_id as the filename extension
+            session_settings_file = 'sessions/learned_settings_file.{}'.format(version_id)
+            if os.path.exists(session_settings_file):
+                settings_file = session_settings_file
+
+        with open(settings_file, 'rb') as sf:
+            gazetteer = dedupe.StaticGazetteer(sf)
+
+        gazetteer.index(canonical)
+
+        results = {}
+        for qid, q in queries.items():
+            results[qid] = {'result': resolvePlace(q, gazetteer, canonical)}
+        return jsonify(results)
+    # if no queries, then return the manifest
+    return jsonify(metadata)
+
+@app.route("/reconcileplacev2", methods=["POST", "GET"])
+def reconcilePlaceV2():
+
+    # if request.method == "GET":
+    #     queries = json.loads(request.args.get("queries", "[]"))
+    #     session_id = request.args.get("session", None)
+    # else:
+    #     queries = json.loads(request.form.get("queries", "[]"))
+    #     session_id = request.form.get("session", None)
+    content = request.json
+    session_id = content.get('session_id')
+    queries = content.get('queries')
+    limit = content.get('limit', 1)
+    threshold = content.get('threshold', 0.5)
+    # look for a new/nonstandard property in the form/params for session
+    version_id = None
+    if session_id:
+        try:
+            valid_uuid_obj = uuid.UUID(session_id, version=4)
+        except ValueError:
+            return False
+        # normalize the sessionid for caps (ab123-xxx vs AB123-)
+        session_id = str(valid_uuid_obj)
+        session_info = query_db("SELECT * from session where id = ?", [str(session_id)], one=True)
+        version_id = session_info[1]
+        if session_info[4] == "NEW":
+            print("WARNING: session has not yet added training data, version_id is {} so default training session will be used".format(version_id))
+    
+    
+    if queries:
+        settings_file = default_settings_file
+        if version_id:
+            # demoware so we don't care about security
+            # also because they're UUIDs for now just treat the version_ids as distinct
+            # though it really should be sesssion_id.version_id as the filename extension
+            session_settings_file = 'sessions/learned_settings_file.{}'.format(version_id)
+            if os.path.exists(session_settings_file):
+                settings_file = session_settings_file
+
+        with open(settings_file, 'rb') as sf:
+            gazetteer = dedupe.StaticGazetteer(sf)
+
+        results = {}
+        for qid, q in queries.items():
+            try:
+                place:dict = q.get("place")
+                candidates = {}
+                for i,candidate in enumerate(q.get("candidates")):
+                    cleanCandidate = processPlace(candidate)
+                    candidates[candidate.get('id', str(i))] = cleanCandidate
+                gazetteer.index(candidates)
+                results[qid] = {'result': resolvePlace(place, gazetteer, candidates, limit, threshold)}
+                gazetteer.unindex(candidates)
+            except ValueError as e:
+                results[qid] = {'error' : e}
+        return jsonify(results)
+    # if no queries, then return the manifest
+    return jsonify(metadata)
 
 if __name__ == '__main__':
 
@@ -305,12 +428,14 @@ if __name__ == '__main__':
             log_level = logging.INFO
         elif opts.verbose >= 2:
             log_level = logging.DEBUG
-    logging.getLogger().setLevel(log_level)
+    logger = logging.getLogger()
+    logger.setLevel(log_level)
 
+    
     # ## Setup
 
-    canon_file = os.path.join('restaurants', 'fodors.csv')
-    messy_file = os.path.join('restaurants', 'zagats.csv')
+    canon_file = os.path.join('places', 'places.tsv')
+    messy_file = os.path.join('places', 'hotelscombined.tsv')
 
     # TODO: the gazetteer interface wants a file of candidate records
     # to match against - the "messy" file that it's trying to match 

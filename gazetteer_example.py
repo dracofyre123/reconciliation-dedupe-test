@@ -17,27 +17,7 @@ import collections
 
 import dedupe
 from unidecode import unidecode
-
-
-def preProcess(column):
-    """
-    Do a little bit of data cleaning with the help of Unidecode and Regex.
-    Things like casing, extra spaces, quotes and new lines can be ignored.
-    """
-
-    column = unidecode(column)
-    column = re.sub('\n', ' ', column)
-    column = re.sub('-', '', column)
-    column = re.sub('/', ' ', column)
-    column = re.sub("'", '', column)
-    column = re.sub(",", '', column)
-    column = re.sub(":", ' ', column)
-    column = re.sub(' +', ' ', column)
-    column = column.strip().strip('"').strip("'").lower().strip()
-    if not column:
-        column = None
-    return column
-
+from extras.utilties import processPlace
 
 def readData(filename):
     """
@@ -48,13 +28,16 @@ def readData(filename):
     data_d = {}
 
     with open(filename) as f:
-        reader = csv.DictReader(f)
+        reader = csv.DictReader(f, delimiter="\t")
         for i, row in enumerate(reader):
-            clean_row = dict([(k, preProcess(v)) for (k, v) in row.items()])
-            if clean_row['class']:
-                clean_row['class'] = int(clean_row['class'])
-            data_d[filename + str(i)] = dict(clean_row)
-
+            try:
+                clean_row = processPlace(row)
+                data_d[filename + str(i)] = clean_row
+                if i % 10000 == 0 and i > 0:
+                    print('Processed {} Records'.format(i))
+            except  Exception as inst:
+                print('Invalid Row: {0}'.format(i))
+                print(inst)
     return data_d
 
 
@@ -84,10 +67,8 @@ if __name__ == '__main__':
     settings_file = 'gazetteer_learned_settings'
     training_file = 'gazetteer_training.json'
 
-    #canon_file = os.path.join('data', 'AbtBuy_Buy.csv')
-    #messy_file = os.path.join('data', 'AbtBuy_Abt.csv')
-    canon_file = os.path.join('restaurants', 'fodors.csv')
-    messy_file = os.path.join('restaurants', 'zagats.csv')
+    canon_file = os.path.join('places', 'places.tsv')
+    messy_file = os.path.join('places', 'hotelscombined.tsv')
 
     print('importing data ...')
     messy = readData(messy_file)
@@ -113,17 +94,34 @@ if __name__ == '__main__':
         # field comparator for the 'price' field.
         # id,name,addr,city,phone,type,class
         fields = [
-            {'field': 'name', 'type': 'String'},
-            #{'field': 'title', 'type': 'Text', 'corpus': descriptions()},
-            #{'field': 'addr', 'type': 'String', 'has missing': True},
-            #{'field': 'city', 'type': 'String', 'has missing': True},
-            #{'field': 'phone', 'type': 'String', 'has missing': True},
-            #{'field': 'type', 'type': 'String', 'has missing': True},
+            {'field': 'name', 'variable name': 'name', 'type': 'String'},
+            {'field' : 'country', 'type': 'Exact', 'variable name': 'country'},
+            {'field' : 'type', 'type': 'ShortString', 'variable name': 'location_type', 'has missing' : True},
+            {'field' : 'location', 'type': 'LatLong', 'variable name':'latlng', 'has missing' : True},
+            {'type': 'Interaction', 'interaction variables': [
+                'name',
+                'country',
+                'location_type',
+                'latlng'
+                ]
+            }
         ]
 
         # Create a new gazetteer object and pass our data model to it.
         gazetteer = dedupe.Gazetteer(fields)
 
+        filteredMessy={}
+        for k,d in messy.items():
+            if d['location'] != None:
+                filteredMessy[k] = d
+
+        filteredCanonical={}
+        for k,d in canonical.items():
+            if d['location'] != None:
+                filteredCanonical[k] = d
+
+
+        markpairs = dedupe.training_data_link(filteredMessy,filteredCanonical, 'destinyid', 5000)
         # If we have training data saved from a previous run of gazetteer,
         # look for it an load it in.
         # __Note:__ if you want to train from scratch, delete the training_file
@@ -142,6 +140,9 @@ if __name__ == '__main__':
         # press 'f' when you are finished
         print('starting active labeling...')
 
+        # gazetteer.sample(messy, canonical, 1000)
+        # gazetteer.index(canonical);
+        gazetteer.mark_pairs(markpairs)
         dedupe.console_label(gazetteer)
 
         gazetteer.train()
